@@ -7,6 +7,7 @@ from shapleqclient.message.api import discover_broker_msg, connect_msg
 from shapleqclient.common.error import PQErrCode
 from typing import Generator
 import logging
+import asyncio
 
 
 class QConfig:
@@ -36,76 +37,82 @@ class ClientBase:
     config: QConfig
     logger: logging.Logger
     _sock: socket.socket
+    _loop: asyncio.AbstractEventLoop
+    _reader: asyncio.StreamReader
+    _writer: asyncio.StreamWriter
 
-    def __init__(self, name: str, config: QConfig):
+    def __init__(self, loop: asyncio.AbstractEventLoop, name: str, config: QConfig):
+        self._loop = loop
         self.logger = logging.getLogger(name)
         self.config = config
 
     def is_connected(self) -> bool:
         return self.connected
 
-    def _connect_to_broker(self, address: str, port: int):
+    async def _connect_to_broker(self, address: str, port: int):
         if self.connected:
             raise ClientConnectionError("already connected to broker")
-
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(self.config.get_timeout() / 1000)
+        asyncio.set_event_loop(self._loop)
         try:
-            self._sock.connect((address, port))
+            future = asyncio.open_connection(address, port)
+            self._reader, self._writer = await asyncio.wait_for(future, timeout=self.config.get_timeout())
             self.connected = True
             self.logger.info('connected to broker target {}:{}'.format(address, port))
 
-        except socket.timeout:
-            raise ClientConnectionError("cannot connect to broker : timeout")
+        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            raise ClientConnectionError("cannot connect to broker : {}".format(e))
 
-    def _send_message(self, msg: QMessage):
-        if self._sock.send(msg.serialize()) <= 0:
-            raise SocketWriteError()
+    async def _send_message(self, msg: QMessage):
+        self._writer.write(msg.serialize())
+        try:
+            await asyncio.wait_for(self._writer.drain(), timeout=self.config.get_timeout())
+        except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+            raise SocketWriteError(str(e))
         self.logger.info('sent data successfully')
 
-    def _read_message(self) -> QMessage:
+    async def _read_message(self) -> QMessage:
+        msg_buf: bytearray = bytearray()
         while True:
             if not self.is_connected():
                 raise SocketClosedError()
 
             try:
-                received = self._sock.recv(4 * 1024)
+                received = await self._reader.read(4 * 1024)
                 if not received:
-                    self.close()
+                    await self.close()
                     raise SocketClosedError()
                 self.logger.info('read data successfully')
+                msg_buf += bytearray(received)
 
                 return make_qmessage_from_buffer(received)
             except NotEnoughBufferError:
                 continue
-            except socket.error as msg:
-                self.logger.error(msg)
-                self.close()
-                raise SocketReadError()
+            except (ConnectionError, TimeoutError, OSError) as e:
+                self.logger.error(e)
+                await self.close()
+                raise SocketReadError(str(e))
 
-    def continuous_receive(self) -> Generator[QMessage, None, None]:
-        msg_buf: bytearray
+    async def continuous_receive(self) -> Generator[QMessage, None, None]:
+        msg_buf: bytearray = bytearray()
 
         while True:
             if not self.is_connected():
                 raise SocketClosedError()
 
             try:
-                received = self._sock.recv(4 * 1024)
+                received = await self._reader.read(4 * 1024)
                 if not received:
-                    self.close()
+                    await self.close()
                     raise SocketClosedError()
-            except socket.timeout:
+            except asyncio.TimeoutError:
                 continue
-            except socket.error as msg:
-                if not self.is_connected():
-                    return
-                self.logger.error(msg)
-                self.close()
+            except (ConnectionError, OSError) as e:
+                self.logger.error(e)
+                await self.close()
                 raise SocketReadError()
 
             self.logger.info('received data')
-            msg_buf = bytearray(received)
+            msg_buf += bytearray(received)
 
             # unmarshal QMessages from received buffer
             while True:
@@ -118,14 +125,15 @@ class ClientBase:
 
                 except NotEnoughBufferError:
                     break
+            await asyncio.sleep(0)
 
-    def _init_stream(self, session_type: SessionType, topic: str):
+    async def _init_stream(self, session_type: SessionType, topic: str):
         if not self.is_connected():
             raise SocketClosedError()
 
         msg = make_qmessage_from_proto(MessageType.STREAM, connect_msg(session_type, topic))
-        self._send_message(msg)
-        received = self._read_message()
+        await self._send_message(msg)
+        received = await self._read_message()
 
         if received.unpack_to(ConnectResponse()) is not None:
             self.logger.info('stream initialized')
@@ -135,15 +143,15 @@ class ClientBase:
         else:
             raise InvalidMessageError()
 
-    def connect(self, session_type: SessionType, topic: str):
+    async def connect(self, session_type: SessionType, topic: str):
         if len(topic) == 0:
             raise TopicNotSetError()
 
-        self._connect_to_broker(self.config.get_broker_address(), self.config.get_broker_port())
+        await self._connect_to_broker(self.config.get_broker_address(), self.config.get_broker_port())
         msg = make_qmessage_from_proto(MessageType.TRANSACTION, discover_broker_msg(topic, session_type))
 
-        self._send_message(msg)
-        received = self._read_message()
+        await self._send_message(msg)
+        received = await self._read_message()
 
         discover_broker_response = DiscoverBrokerResponse()
         if received.unpack_to(discover_broker_response) is None:
@@ -152,13 +160,14 @@ class ClientBase:
         if discover_broker_response.error_code != PQErrCode.Success.value:
             raise RequestFailedError(msg=discover_broker_response.error_message)
 
-        self.close()
+        await self.close()
         new_addr = discover_broker_response.address.split(':')
-        self._connect_to_broker(new_addr[0], int(new_addr[1]))
-        self._init_stream(session_type, topic)
+        await self._connect_to_broker(new_addr[0], int(new_addr[1]))
+        await self._init_stream(session_type, topic)
 
-    def close(self):
+    async def close(self):
         if self.connected:
             self.connected = False
-            self._sock.close()
+            self._writer.close()
+            await self._writer.wait_closed()
             self.logger.info('connection closed')

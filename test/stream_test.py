@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 import time
@@ -7,7 +8,7 @@ from kazoo.client import KazooClient
 
 from shapleqclient.admin import Admin
 from shapleqclient.base import QConfig
-from shapleqclient.consumer import Consumer
+from shapleqclient.consumer import Consumer, FetchResult
 from shapleqclient.producer import Producer
 import uuid
 
@@ -44,91 +45,108 @@ class StreamTest(unittest.TestCase):
         admin.close()
 
     def test_connect(self):
-        topic = "test_topic_1"
+        loop = asyncio.get_event_loop()
 
-        self.create_topic(topic)
+        async def _t():
+            topic = "test_topic_1"
 
-        producer = Producer(self.config, topic)
-        producer.setup()
+            self.create_topic(topic)
 
-        consumer = Consumer(self.config, topic)
-        consumer.setup()
+            producer = Producer(loop, self.config, topic)
+            await producer.setup()
 
-        self.assertTrue(producer.is_connected())
-        self.assertTrue(consumer.is_connected())
+            consumer = Consumer(loop, self.config, topic)
+            await consumer.setup()
 
-        consumer.close()
-        producer.close()
+            self.assertTrue(producer.is_connected())
+            self.assertTrue(consumer.is_connected())
+
+            await consumer.terminate()
+            await producer.terminate()
+
+        loop.run_until_complete(_t())
 
     def test_pupsub(self):
-        topic = "test_topic_2"
-        expected_records = [b'google', b'paust', b'123456']
-        actual_records = []
+        loop = asyncio.new_event_loop()
 
-        self.create_topic(topic)
+        async def _t():
+            topic = "test_topic_2"
+            expected_records = [b'google', b'paust', b'123456']
+            actual_records = []
 
-        producer = Producer(self.config, topic)
-        producer.setup()
+            self.create_topic(topic)
 
-        consumer = Consumer(self.config, topic)
-        consumer.setup()
+            producer = Producer(loop, self.config, topic)
+            await producer.setup()
 
-        def publish():
+            consumer = Consumer(loop, self.config, topic)
+            await consumer.setup()
+
+            subscribe_task = loop.create_task(consumer.subscribe(0))
+            wait_publish_response_task = loop.create_task(producer.wait_publish_response())
+
+            async def on_subscribe(result: FetchResult):
+                for item in result.items:
+                    actual_records.append(item.data)
+                if len(actual_records) == len(expected_records):
+                    subscribe_task.cancel()
+                    wait_publish_response_task.cancel()
+
+            consumer.on_subscribe(on_subscribe)
+
             time.sleep(1)
             for seq, record in enumerate(expected_records):
-                producer.publish(record, seq, self.node_id)
+                await producer.publish(record, seq, self.node_id)
 
-        producer_thread = threading.Thread(target=publish)
-        producer_thread.start()
+            for index, data in enumerate(actual_records):
+                self.assertEqual(data, expected_records[index])
 
-        for fetched_data in consumer.subscribe(0):
-            for item in fetched_data.items:
-                actual_records.append(item.data)
-            if len(actual_records) == len(expected_records):
-                break
+            await asyncio.gather(*[subscribe_task, wait_publish_response_task])
+            await producer.terminate()
+            await consumer.terminate()
 
-        producer_thread.join()
-
-        for index, data in enumerate(actual_records):
-            self.assertEqual(data, expected_records[index])
-
-        producer.close()
-        consumer.close()
+        loop.run_until_complete(_t())
 
     def test_batch_fetch(self):
-        topic = "test_topic_3"
-        expected_records = [b'google', b'paust', b'123456',
-                            b'google2', b'paust2', b'1234562',
-                            b'google3', b'paust3', b'1234563',
-                            b'google4', b'paust4', b'1234564']
-        actual_records = []
+        loop = asyncio.get_event_loop()
 
-        self.create_topic(topic)
+        async def _t():
+            topic = "test_topic_3"
+            expected_records = [b'google', b'paust', b'123456',
+                                b'google2', b'paust2', b'1234562',
+                                b'google3', b'paust3', b'1234563',
+                                b'google4', b'paust4', b'1234564']
+            actual_records = []
 
-        producer = Producer(self.config, topic)
-        producer.setup()
+            self.create_topic(topic)
 
-        consumer = Consumer(self.config, topic)
-        consumer.setup()
+            producer = Producer(loop, self.config, topic)
+            await producer.setup()
 
-        def publish():
+            consumer = Consumer(loop, self.config, topic)
+            await consumer.setup()
+
+            subscribe_task = loop.create_task(consumer.subscribe(0, max_batch_size=3, flush_interval=200))
+            wait_publish_response_task = loop.create_task(producer.wait_publish_response())
+
+            async def on_subscribe(result: FetchResult):
+                for item in result.items:
+                    actual_records.append(item.data)
+                if len(actual_records) == len(expected_records):
+                    subscribe_task.cancel()
+                    wait_publish_response_task.cancel()
+
+            consumer.on_subscribe(on_subscribe)
+
             time.sleep(1)
             for seq, record in enumerate(expected_records):
-                producer.publish(record, seq, self.node_id)
+                await producer.publish(record, seq, self.node_id)
 
-        producer_thread = threading.Thread(target=publish)
-        producer_thread.start()
+            for index, data in enumerate(actual_records):
+                self.assertEqual(data, expected_records[index])
 
-        for fetched_data in consumer.subscribe(0, max_batch_size=3, flush_interval=200):
-            for item in fetched_data.items:
-                actual_records.append(item.data)
-            if len(actual_records) == len(expected_records):
-                break
+            await asyncio.gather(*[subscribe_task, wait_publish_response_task])
+            await producer.terminate()
+            await consumer.terminate()
 
-        producer_thread.join()
-
-        for index, data in enumerate(actual_records):
-            self.assertEqual(data, expected_records[index])
-
-        producer.close()
-        consumer.close()
+        loop.run_until_complete(_t())

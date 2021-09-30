@@ -3,9 +3,10 @@ from shapleqclient.base import ClientBase, QConfig
 from shapleqclient.common.exception import InvalidMessageError, SocketClosedError, RequestFailedError
 from shapleqclient.proto.data_pb2 import SessionType
 from shapleqclient.proto.api_pb2 import FetchResponse, BatchedFetchResponse, Ack
-from typing import Generator, Iterable
+from typing import Generator, Iterable, Callable, Awaitable
 from shapleqclient.message.qmessage import QMessage, MessageType, make_qmessage_from_proto
 from shapleqclient.message.api import fetch_msg
+import asyncio
 
 
 @dataclass
@@ -24,27 +25,31 @@ class FetchResult:
 
 class Consumer(ClientBase):
     topic: str
+    _on_subscribe: Callable[[FetchResult], Awaitable[None]]
 
-    def __init__(self, config: QConfig, topic: str):
-        super().__init__("ShapleQ-Consumer", config)
+    def __init__(self, loop: asyncio.AbstractEventLoop, config: QConfig, topic: str):
+        super().__init__(loop, "ShapleQ-Consumer", config)
         self.topic = topic
 
-    def setup(self):
-        self.connect(SessionType.SUBSCRIBER, self.topic)
+    async def setup(self):
+        await self.connect(SessionType.SUBSCRIBER, self.topic)
 
-    def terminate(self):
-        self.close()
+    async def terminate(self):
+        await self.close()
 
-    def subscribe(self, start_offset: int, max_batch_size: int = 1, flush_interval: int = 100) -> Generator[FetchResult, None, None]:
+    def on_subscribe(self, fn: Callable[[FetchResult], Awaitable[None]]):
+        self._on_subscribe = fn
+
+    async def subscribe(self, start_offset: int, max_batch_size: int = 1, flush_interval: int = 100):
         if not self.is_connected():
             raise SocketClosedError()
 
         try:
             msg = make_qmessage_from_proto(MessageType.STREAM, fetch_msg(start_offset, max_batch_size, flush_interval))
-            self._send_message(msg)
-            for received in self.continuous_receive():
-                yield self._handle_message(received)
-        except SocketClosedError:
+            await self._send_message(msg)
+            async for received in self.continuous_receive():
+                await self._on_subscribe(self._handle_message(received))
+        except (SocketClosedError, asyncio.CancelledError):
             return
 
     def _handle_message(self, msg: QMessage) -> FetchResult:
